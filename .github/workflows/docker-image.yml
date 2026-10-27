@@ -7,10 +7,12 @@ on:
   pull_request:
     branches:
       - main
-    if: github.repository == 'huangxd-/danmu_api'
 
 jobs:
   build:
+    # Forks do not publish Docker images unless explicitly enabled in repository variables.
+    # To opt in, set ENABLE_DOCKER_PUBLISH=true and configure DOCKER_USERNAME/DOCKER_PASSWORD secrets.
+    if: ${{ github.repository == 'huangxd-/danmu_api' || (github.event_name == 'push' && vars.ENABLE_DOCKER_PUBLISH == 'true') }}
     runs-on: ubuntu-latest
 
     steps:
