@@ -1,44 +1,83 @@
 name: Fork Sync
 
-permissions:
-    contents: write
-
 on:
-    schedule:
-        - cron: "0 0 * * *"  # 每天午夜执行
-    workflow_dispatch:  # 允许手动触发
+  schedule:
+    - cron: "0 0 * * *" # Every day at 00:00 UTC
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/sync_fork.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-sync-main
+  cancel-in-progress: false
 
 jobs:
-    sync_with_upstream:
-        name: Sync with Upstream
-        runs-on: ubuntu-latest
-        if: ${{ github.event.repository.fork }}
+  sync_with_upstream:
+    name: Sync with Upstream (excluding workflows)
+    runs-on: ubuntu-latest
+    if: github.event.repository.fork && github.ref == 'refs/heads/main'
 
-        steps:
-            - name: Checkout target repo
-              uses: actions/checkout@v5
-              with:
-                token: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
-            - name: Sync Upstream
-              uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.3
-              with:
-                  target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-                  upstream_sync_repo: huangxd-/danmu_api
-                  upstream_sync_branch: main
-                  target_sync_branch: main
-                  test_mode: false
+      - name: Sync upstream code without modifying workflows
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            - name: Check for new commits
-              if: success()
-              run: echo "Sync completed successfully"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-            - name: Check for Failure
-              if: failure()
-              run: |
-                  echo "[Error] Sync failed. This might be due to:"
-                  echo "1. Changes in the upstream workflow file"
-                  echo "2. Merge conflicts that need manual resolution"
-                  echo "3. Network issues"
-                  echo "Please check the logs and consider manual sync if needed."
-                  exit 1
+          git remote add upstream https://github.com/huangxd-/danmu_api.git
+          git fetch --no-tags upstream main
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+
+          # Track the previously applied upstream revision. Initially, the
+          # fork's merge-base is the last upstream commit it already contains.
+          baseline_file=".github/upstream-sync-base"
+          if [[ -f "$baseline_file" ]]; then
+            base_sha=$(tr -d '\r\n' < "$baseline_file")
+          else
+            base_sha=$(git merge-base HEAD "$upstream_sha")
+          fi
+
+          if [[ -z "$base_sha" ]]; then
+            echo "::error::Unable to determine the last upstream revision."
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "$base_sha" "$upstream_sha"; then
+            echo "::error::Upstream history changed; manual review is required."
+            exit 1
+          fi
+
+          echo "Syncing upstream changes: $base_sha -> $upstream_sha"
+          if [[ "$base_sha" != "$upstream_sha" ]]; then
+            # Apply only the incremental code changes, not upstream GitHub
+            # workflows. GITHUB_TOKEN cannot push workflow file updates.
+            git diff --binary "$base_sha" "$upstream_sha" -- . ':(exclude).github/workflows/**' > "$RUNNER_TEMP/upstream.patch"
+            if [[ -s "$RUNNER_TEMP/upstream.patch" ]]; then
+              git apply --3way --index "$RUNNER_TEMP/upstream.patch"
+            fi
+          fi
+
+          printf '%s\n' "$upstream_sha" > "$baseline_file"
+          git add -- "$baseline_file"
+
+          if git diff --cached --quiet; then
+            echo "Already up to date. No code changes to push."
+            exit 0
+          fi
+
+          git diff --cached --name-status
+          git commit -m "chore: sync upstream code (excluding workflows)"
+          git push origin HEAD:main
